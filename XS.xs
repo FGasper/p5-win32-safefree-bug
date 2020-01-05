@@ -56,6 +56,8 @@ create()
         DEFERRED_CLASS_TYPE* deferred_ptr;
         Newxz(deferred_ptr, 1, DEFERRED_CLASS_TYPE);
 
+        fprintf(stderr, "created: %lu\n", deferred_ptr);
+
         deferred_ptr->promise = NULL;
 
         RETVAL = _ptr_to_svrv(aTHX_ deferred_ptr, MY_CXT.pxs_deferred_stash);
@@ -67,6 +69,6 @@ DESTROY(SV *self_sv)
     CODE:
         DEFERRED_CLASS_TYPE* self = _get_deferred_from_sv(aTHX_ self_sv);
 
-        fprintf(stderr, "before free self\n");
+        fprintf(stderr, "before free self (%lu)\n", self);
         Safefree(self);
         fprintf(stderr, "after free self\n");
