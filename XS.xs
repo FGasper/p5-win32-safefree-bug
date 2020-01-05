@@ -29,18 +29,8 @@ typedef enum {
 
 struct xspr_promise_s {
     xspr_promise_state_t state;
-    pid_t detect_leak_pid;
     void* unhandled_rejection;
     int refs;
-    union {
-        struct {
-            void** callbacks;
-            int callbacks_count;
-        } pending;
-        struct {
-            void *result;
-        } finished;
-    };
 };
 
 xspr_promise_t* xspr_promise_new(pTHX);
@@ -82,10 +72,6 @@ SV* _ptr_to_svrv(pTHX_ void* ptr, HV* stash) {
 
 static inline xspr_promise_t* create_promise(pTHX) {
     xspr_promise_t* promise = xspr_promise_new(aTHX);
-
-    SV *detect_leak_perl = get_sv("Demo::XS::DETECT_MEMORY_LEAKS", 0);
-
-    promise->detect_leak_pid = SvTRUE(detect_leak_perl) ? getpid() : 0;
 
     return promise;
 }
