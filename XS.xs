@@ -100,13 +100,9 @@ void xspr_promise_finish(pTHX_ xspr_promise_t* promise, xspr_result_t *result);
 void xspr_promise_incref(pTHX_ xspr_promise_t* promise);
 void xspr_promise_decref(pTHX_ xspr_promise_t* promise);
 
-xspr_result_t* xspr_result_new(pTHX_ xspr_result_state_t state, unsigned count);
-xspr_result_t* xspr_result_from_error(pTHX_ const char *error);
-void xspr_result_incref(pTHX_ xspr_result_t* result);
 void xspr_result_decref(pTHX_ xspr_result_t* result);
 
 xspr_result_t* xspr_invoke_perl(pTHX_ SV* perl_fn, SV** inputs, unsigned input_count);
-xspr_promise_t* xspr_promise_from_sv(pTHX_ SV* input);
 
 
 typedef struct {
@@ -135,100 +131,6 @@ typedef struct {
 
 START_MY_CXT
 
-/* Process a single callback */
-void xspr_callback_process(pTHX_ xspr_callback_t* callback, xspr_promise_t* origin)
-{
-    assert(origin->state == XSPR_STATE_FINISHED);
-
-    if (callback->type == XSPR_CALLBACK_CHAIN) {
-        xspr_promise_finish(aTHX_ callback->chain, origin->finished.result);
-
-    } else if (callback->type == XSPR_CALLBACK_PERL) {
-        SV* callback_fn;
-
-        if (origin->finished.result->state == XSPR_RESULT_RESOLVED) {
-            callback_fn = callback->perl.on_resolve;
-        } else if (origin->finished.result->state == XSPR_RESULT_REJECTED) {
-            callback_fn = callback->perl.on_reject;
-
-            // If we got a REJECTED callback, then we’re handling the rejection.
-            // Even if not, though, we’re creating another promise, and that
-            // promise will either handle the rejection or report non-handling.
-            // So, in either case, we want to clear the unhandled rejection.
-            origin->unhandled_rejection = NULL;
-        } else {
-            callback_fn = NULL; /* Be quiet, bad compiler! */
-            assert(0);
-        }
-
-        if (callback_fn != NULL) {
-            xspr_result_t* result;
-            result = xspr_invoke_perl(aTHX_
-                                      callback_fn,
-                                      origin->finished.result->results,
-                                      origin->finished.result->count
-                                      );
-
-            if (callback->perl.next != NULL) {
-                int skip_passthrough = 0;
-
-                if (result->count == 1 && result->state == XSPR_RESULT_RESOLVED) {
-                    xspr_promise_t* promise = xspr_promise_from_sv(aTHX_ result->results[0]);
-                    if (promise != NULL) {
-                        if ( promise == callback->perl.next) {
-                            /* This is an extreme corner case the A+ spec made us implement: we need to reject
-                            * cases where the promise created from then() is passed back to its own callback */
-                            xspr_result_t* chain_error = xspr_result_from_error(aTHX_ "TypeError");
-                            xspr_promise_finish(aTHX_ callback->perl.next, chain_error);
-
-                            xspr_result_decref(aTHX_ chain_error);
-                        }
-                        else {
-                            /* Fairly normal case: we returned a promise from the callback */
-                            xspr_callback_t* chainback = xspr_callback_new_chain(aTHX_ callback->perl.next);
-                            xspr_promise_then(aTHX_ promise, chainback);
-                            promise->unhandled_rejection = NULL;
-                        }
-
-                        xspr_promise_decref(aTHX_ promise);
-                        skip_passthrough = 1;
-                    }
-                }
-
-                if (!skip_passthrough) {
-                    xspr_promise_finish(aTHX_ callback->perl.next, result);
-                }
-            }
-
-            xspr_result_decref(aTHX_ result);
-
-        } else if (callback->perl.next) {
-            /* No callback, so we're just passing the result along. */
-            xspr_result_t* result = origin->finished.result;
-            xspr_promise_finish(aTHX_ callback->perl.next, result);
-        }
-
-    } else if (callback->type == XSPR_CALLBACK_FINALLY) {
-        SV* callback_fn = callback->finally.on_finally;
-        if (callback_fn != NULL) {
-            xspr_result_t* result;
-            result = xspr_invoke_perl(aTHX_
-                                      callback_fn,
-                                      origin->finished.result->results,
-                                      origin->finished.result->count
-                                      );
-            xspr_result_decref(aTHX_ result);
-        }
-
-        if (callback->finally.next != NULL) {
-            xspr_promise_finish(aTHX_ callback->finally.next, origin->finished.result);
-        }
-
-    } else {
-        assert(0);
-    }
-}
-
 /* Frees the xspr_callback_t structure */
 void xspr_callback_free(pTHX_ xspr_callback_t *callback)
 {
@@ -253,163 +155,6 @@ void xspr_callback_free(pTHX_ xspr_callback_t *callback)
     Safefree(callback);
 }
 
-/* Add a callback invocation into the queue for the given origin promise.
- * Takes ownership of the callback structure */
-void xspr_queue_add(pTHX_ xspr_callback_t* callback, xspr_promise_t* origin)
-{
-    dMY_CXT;
-
-    xspr_callback_queue_t* entry;
-    Newxz(entry, 1, xspr_callback_queue_t);
-    entry->origin = origin;
-    xspr_promise_incref(aTHX_ entry->origin);
-    entry->callback = callback;
-
-    if (MY_CXT.queue_head == NULL) {
-        assert(MY_CXT.queue_tail == NULL);
-        /* Empty queue, so now it's just us */
-        MY_CXT.queue_head = entry;
-        MY_CXT.queue_tail = entry;
-
-    } else {
-        assert(MY_CXT.queue_tail != NULL);
-        /* Existing queue, add to the tail */
-        MY_CXT.queue_tail->next = entry;
-        MY_CXT.queue_tail = entry;
-    }
-}
-
-void _call_with_1_or_2_args( pTHX_ SV* cb, SV* maybe_arg0, SV* arg1 ) {
-    // --- Almost all copy-paste from “perlcall” … blegh!
-    dSP;
-
-    ENTER;
-    SAVETMPS;
-
-    PUSHMARK(SP);
-
-    if (maybe_arg0) {
-        EXTEND(SP, 2);
-        PUSHs(maybe_arg0);
-    }
-    else {
-        EXTEND(SP, 1);
-    }
-
-    PUSHs( arg1 );
-    PUTBACK;
-
-    call_sv(cb, G_VOID);
-
-    FREETMPS;
-    LEAVE;
-
-    return;
-}
-
-void _call_pv_with_args( pTHX_ const char* subname, SV** args, unsigned argscount )
-{
-    // --- Almost all copy-paste from “perlcall” … blegh!
-    dSP;
-
-    ENTER;
-    SAVETMPS;
-
-    PUSHMARK(SP);
-    EXTEND(SP, argscount);
-
-    unsigned i;
-    for (i=0; i<argscount; i++) {
-        PUSHs(args[i]);
-    }
-
-    PUTBACK;
-
-    call_pv(subname, G_VOID);
-
-    FREETMPS;
-    LEAVE;
-
-    return;
-}
-
-void xspr_queue_maybe_schedule(pTHX)
-{
-    dMY_CXT;
-    if (MY_CXT.queue_head == NULL || MY_CXT.backend_scheduled || MY_CXT.in_flush) {
-        return;
-    }
-
-    MY_CXT.backend_scheduled = 1;
-    /* We trust our backends to be sane, so little guarding against errors here */
-
-    if (!MY_CXT.pxs_flush_cr) {
-        HV *stash = gv_stashpv(DEFERRED_CLASS, 0);
-        GV* method_gv = gv_fetchmethod_autoload(stash, "___flush", FALSE);
-        if (method_gv != NULL && isGV(method_gv) && GvCV(method_gv) != NULL) {
-            MY_CXT.pxs_flush_cr = newRV_inc( (SV*)GvCV(method_gv) );
-        }
-        else {
-            assert(0);
-        }
-    }
-
-    _call_with_1_or_2_args(aTHX_ MY_CXT.deferral_cr, MY_CXT.deferral_arg, MY_CXT.pxs_flush_cr);
-}
-
-/* Invoke the user's perl code. We need to be really sure this doesn't return early via croak/next/etc. */
-xspr_result_t* xspr_invoke_perl(pTHX_ SV* perl_fn, SV** inputs, unsigned input_count)
-{
-    dSP;
-    unsigned count, i;
-    SV* error;
-    xspr_result_t* result;
-
-    if (!SvROK(perl_fn)) {
-        return xspr_result_from_error(aTHX_ "promise callbacks need to be a CODE reference");
-    }
-
-    ENTER;
-    SAVETMPS;
-
-    PUSHMARK(SP);
-    EXTEND(SP, input_count);
-    for (i = 0; i < input_count; i++) {
-        PUSHs(inputs[i]);
-    }
-    PUTBACK;
-
-    /* Clear $_ so that callbacks don't end up talking to each other by accident */
-    SAVE_DEFSV;
-    DEFSV_set(sv_newmortal());
-
-    count = call_sv(perl_fn, G_EVAL|G_ARRAY);
-
-    SPAGAIN;
-    error = ERRSV;
-    if (SvTRUE(error)) {
-        result = xspr_result_new(aTHX_ XSPR_RESULT_REJECTED, 1);
-        result->results[0] = newSVsv(error);
-    } else {
-        result = xspr_result_new(aTHX_ XSPR_RESULT_RESOLVED, count);
-        for (i = 0; i < count; i++) {
-            result->results[count-i-1] = SvREFCNT_inc(POPs);
-        }
-    }
-    PUTBACK;
-
-    FREETMPS;
-    LEAVE;
-
-    return result;
-}
-
-/* Increments the ref count for xspr_result_t */
-void xspr_result_incref(pTHX_ xspr_result_t* result)
-{
-    result->refs++;
-}
-
 /* Decrements the ref count for the xspr_result_t, freeing the structure if needed */
 void xspr_result_decref(pTHX_ xspr_result_t* result)
 {
@@ -421,67 +166,6 @@ void xspr_result_decref(pTHX_ xspr_result_t* result)
         Safefree(result->results);
         Safefree(result);
     }
-}
-
-void xspr_immediate_process(pTHX_ xspr_callback_t* callback, xspr_promise_t* promise)
-{
-    xspr_callback_process(aTHX_ callback, promise);
-
-    /* Destroy the structure */
-    xspr_callback_free(aTHX_ callback);
-}
-
-/* Transitions a promise from pending to finished, using the given result */
-void xspr_promise_finish(pTHX_ xspr_promise_t* promise, xspr_result_t* result)
-{
-    dMY_CXT;
-
-    assert(promise->state == XSPR_STATE_PENDING);
-    xspr_callback_t** pending_callbacks = promise->pending.callbacks;
-    int count = promise->pending.callbacks_count;
-
-    if (count == 0 && result->state == XSPR_RESULT_REJECTED) {
-        promise->unhandled_rejection = result;
-    }
-
-    promise->state = XSPR_STATE_FINISHED;
-    promise->finished.result = result;
-    xspr_result_incref(aTHX_ promise->finished.result);
-
-    unsigned i;
-    for (i = 0; i < count; i++) {
-        if (MY_CXT.deferral_cr) {
-            xspr_queue_add(aTHX_ pending_callbacks[i], promise);
-        }
-        else {
-            xspr_immediate_process(aTHX_ pending_callbacks[i], promise);
-        }
-    }
-
-    if (MY_CXT.deferral_cr) {
-        xspr_queue_maybe_schedule(aTHX);
-    }
-
-    Safefree(pending_callbacks);
-}
-
-/* Create a new xspr_result_t object with the given number of item slots */
-xspr_result_t* xspr_result_new(pTHX_ xspr_result_state_t state, unsigned count)
-{
-    xspr_result_t* result;
-    Newxz(result, 1, xspr_result_t);
-    Newxz(result->results, count, SV*);
-    result->state = state;
-    result->refs = 1;
-    result->count = count;
-    return result;
-}
-
-xspr_result_t* xspr_result_from_error(pTHX_ const char *error)
-{
-    xspr_result_t* result = xspr_result_new(aTHX_ XSPR_RESULT_REJECTED, 1);
-    result->results[0] = newSVpv(error, 0);
-    return result;
 }
 
 /* Increments the ref count for xspr_promise_t */
@@ -503,9 +187,6 @@ void xspr_promise_decref(pTHX_ xspr_promise_t *promise)
                 xspr_callback_free(aTHX_ callbacks[i]);
             }
             Safefree(callbacks);
-
-        } else if (promise->state == XSPR_STATE_FINISHED) {
-            xspr_result_decref(aTHX_ promise->finished.result);
 
         } else {
             assert(0);
@@ -551,78 +232,6 @@ xspr_callback_t* xspr_callback_new_chain(pTHX_ xspr_promise_t* chain)
     return callback;
 }
 
-/* Adds a then to the promise. Takes ownership of the callback */
-void xspr_promise_then(pTHX_ xspr_promise_t* promise, xspr_callback_t* callback)
-{
-    dMY_CXT;
-
-    if (promise->state == XSPR_STATE_PENDING) {
-        promise->pending.callbacks_count++;
-        Renew(promise->pending.callbacks, promise->pending.callbacks_count, xspr_callback_t*);
-        promise->pending.callbacks[promise->pending.callbacks_count-1] = callback;
-
-    } else if (promise->state == XSPR_STATE_FINISHED) {
-
-        if (MY_CXT.deferral_cr) {
-            xspr_queue_add(aTHX_ callback, promise);
-            xspr_queue_maybe_schedule(aTHX);
-        }
-        else {
-            xspr_immediate_process(aTHX_ callback, promise);
-        }
-    } else {
-        assert(0);
-    }
-}
-
-/* Returns a promise if the given SV is a thenable. Ownership handed to the caller! */
-xspr_promise_t* xspr_promise_from_sv(pTHX_ SV* input)
-{
-    if (input == NULL || !sv_isobject(input)) {
-        return NULL;
-    }
-
-    /* If we got one of our own promises: great, not much to do here! */
-    if (sv_derived_from(input, PROMISE_CLASS)) {
-        IV tmp = SvIV((SV*)SvRV(input));
-        PROMISE_CLASS_TYPE* promise = INT2PTR(PROMISE_CLASS_TYPE*, tmp);
-        xspr_promise_incref(aTHX_ promise->promise);
-        return promise->promise;
-    }
-
-    /* Maybe we got another type of promise. Let's convert it */
-    GV* method_gv = gv_fetchmethod_autoload(SvSTASH(SvRV(input)), "then", FALSE);
-    if (method_gv != NULL && isGV(method_gv) && GvCV(method_gv) != NULL) {
-        dMY_CXT;
-
-        xspr_result_t* new_result = xspr_invoke_perl(aTHX_ MY_CXT.conversion_helper, &input, 1);
-        if (new_result->state == XSPR_RESULT_RESOLVED &&
-            new_result->results != NULL &&
-            new_result->count == 1 &&
-            SvROK(new_result->results[0]) &&
-            sv_derived_from(new_result->results[0], PROMISE_CLASS)) {
-            /* This is expected: our conversion function returned us one of our own promises */
-            IV tmp = SvIV((SV*)SvRV(new_result->results[0]));
-            PROMISE_CLASS_TYPE* new_promise = INT2PTR(PROMISE_CLASS_TYPE*, tmp);
-
-            xspr_promise_t* promise = new_promise->promise;
-            xspr_promise_incref(aTHX_ promise);
-
-            xspr_result_decref(aTHX_ new_result);
-            return promise;
-
-        } else {
-            xspr_promise_t* promise = xspr_promise_new(aTHX);
-            xspr_promise_finish(aTHX_ promise, new_result);
-            xspr_result_decref(aTHX_ new_result);
-            return promise;
-        }
-    }
-
-    /* We didn't get a promise. */
-    return NULL;
-}
-
 DEFERRED_CLASS_TYPE* _get_deferred_from_sv(pTHX_ SV *self_sv) {
     SV *referent = SvRV(self_sv);
     return INT2PTR(DEFERRED_CLASS_TYPE*, SvUV(referent));
@@ -644,12 +253,6 @@ static inline xspr_promise_t* create_promise(pTHX) {
     promise->detect_leak_pid = SvTRUE(detect_leak_perl) ? getpid() : 0;
 
     return promise;
-}
-
-static inline void _warn_on_destroy_if_needed(pTHX_ xspr_promise_t* promise, SV* self_sv) {
-    if (promise->detect_leak_pid && PXS_IS_GLOBAL_DESTRUCTION && promise->detect_leak_pid == getpid()) {
-        warn( "======================================================================\nXXXXXX - %s survived until global destruction; memory leak likely!\n======================================================================\n", SvPV_nolen(self_sv) );
-    }
 }
 
 //----------------------------------------------------------------------
@@ -753,20 +356,9 @@ create()
         RETVAL
 
 void
-___set_conversion_helper(helper)
-        SV* helper
-    CODE:
-        dMY_CXT;
-        if (MY_CXT.conversion_helper != NULL)
-            croak("Refusing to set a conversion helper twice");
-        MY_CXT.conversion_helper = newSVsv(helper);
-
-void
 DESTROY(SV *self_sv)
     CODE:
         DEFERRED_CLASS_TYPE* self = _get_deferred_from_sv(aTHX_ self_sv);
-
-        _warn_on_destroy_if_needed(aTHX_ self->promise, self_sv);
 
         xspr_promise_decref(aTHX_ self->promise);
         Safefree(self);
