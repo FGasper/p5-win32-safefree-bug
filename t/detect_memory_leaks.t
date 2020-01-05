@@ -16,6 +16,8 @@ use Demo::XS;
     my $pid = fork or do {
         exit;
     };
+
+    waitpid $pid, 0;
 }
 
 ok 1;
