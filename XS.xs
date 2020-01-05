@@ -13,30 +13,15 @@
 
 #define PROMISE_CLASS "Demo::XS::Promise"
 
-#ifdef PL_phase
-#define PXS_IS_GLOBAL_DESTRUCTION PL_phase == PERL_PHASE_DESTRUCT
-#else
-#define PXS_IS_GLOBAL_DESTRUCTION PL_dirty
-#endif
-
 typedef struct xspr_promise_s xspr_promise_t;
 
-typedef enum {
-    XSPR_STATE_NONE,
-    XSPR_STATE_PENDING,
-    XSPR_STATE_FINISHED,
-} xspr_promise_state_t;
-
 struct xspr_promise_s {
-    xspr_promise_state_t state;
-    void* unhandled_rejection;
     int refs;
 };
 
 xspr_promise_t* xspr_promise_new(pTHX);
 
 typedef struct {
-    HV* pxs_stash;
     HV* pxs_deferred_stash;
 } my_cxt_t;
 
@@ -52,8 +37,6 @@ xspr_promise_t* xspr_promise_new(pTHX)
     xspr_promise_t* promise;
     Newxz(promise, 1, xspr_promise_t);
     promise->refs = 1;
-    promise->state = XSPR_STATE_PENDING;
-    promise->unhandled_rejection = NULL;
     return promise;
 }
 
@@ -84,7 +67,6 @@ BOOT:
 {
     MY_CXT_INIT;
 
-    MY_CXT.pxs_stash = gv_stashpv(PROMISE_CLASS, FALSE);
     MY_CXT.pxs_deferred_stash = gv_stashpv(DEFERRED_CLASS, FALSE);
 }
 
