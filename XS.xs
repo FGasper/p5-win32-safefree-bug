@@ -19,9 +19,7 @@
 #define PXS_IS_GLOBAL_DESTRUCTION PL_dirty
 #endif
 
-typedef struct xspr_callback_s xspr_callback_t;
 typedef struct xspr_promise_s xspr_promise_t;
-typedef struct xspr_result_s xspr_result_t;
 
 typedef enum {
     XSPR_STATE_NONE,
@@ -29,65 +27,23 @@ typedef enum {
     XSPR_STATE_FINISHED,
 } xspr_promise_state_t;
 
-typedef enum {
-    XSPR_RESULT_NONE,
-    XSPR_RESULT_RESOLVED,
-    XSPR_RESULT_REJECTED,
-    XSPR_RESULT_BOTH
-} xspr_result_state_t;
-
-typedef enum {
-    XSPR_CALLBACK_PERL,
-    XSPR_CALLBACK_FINALLY,
-    XSPR_CALLBACK_CHAIN
-} xspr_callback_type_t;
-
-struct xspr_callback_s {
-    xspr_callback_type_t type;
-    union {
-        struct {
-            SV* on_resolve;
-            SV* on_reject;
-            xspr_promise_t* next;
-        } perl;
-        struct {
-            SV* on_finally;
-            xspr_promise_t* next;
-        } finally;
-        xspr_promise_t* chain;
-    };
-};
-
-struct xspr_result_s {
-    xspr_result_state_t state;
-    SV** results;
-    int count;
-    int refs;
-};
-
 struct xspr_promise_s {
     xspr_promise_state_t state;
     pid_t detect_leak_pid;
-    xspr_result_t* unhandled_rejection;
+    void* unhandled_rejection;
     int refs;
     union {
         struct {
-            xspr_callback_t** callbacks;
+            void** callbacks;
             int callbacks_count;
         } pending;
         struct {
-            xspr_result_t *result;
+            void *result;
         } finished;
     };
 };
 
 xspr_promise_t* xspr_promise_new(pTHX);
-void xspr_promise_decref(pTHX_ xspr_promise_t* promise);
-
-void xspr_result_decref(pTHX_ xspr_result_t* result);
-
-xspr_result_t* xspr_invoke_perl(pTHX_ SV* perl_fn, SV** inputs, unsigned input_count);
-
 
 typedef struct {
     HV* pxs_stash;
@@ -99,35 +55,6 @@ typedef struct {
 } DEFERRED_CLASS_TYPE;
 
 START_MY_CXT
-
-/* Decrements the ref count for the xspr_result_t, freeing the structure if needed */
-void xspr_result_decref(pTHX_ xspr_result_t* result)
-{
-    if (--(result->refs) == 0) {
-        unsigned i;
-        for (i = 0; i < result->count; i++) {
-            SvREFCNT_dec(result->results[i]);
-        }
-        Safefree(result->results);
-        Safefree(result);
-    }
-}
-
-/* Decrements the ref count for the xspr_promise_t, freeing the structure if needed */
-void xspr_promise_decref(pTHX_ xspr_promise_t *promise)
-{
-    if (--(promise->refs) == 0) {
-        if (promise->state == XSPR_STATE_PENDING) {
-            xspr_callback_t **callbacks = promise->pending.callbacks;
-            Safefree(callbacks);
-
-        } else {
-            assert(0);
-        }
-
-        Safefree(promise);
-    }
-}
 
 /* Creates a new promise. It's that simple. */
 xspr_promise_t* xspr_promise_new(pTHX)
@@ -200,5 +127,7 @@ DESTROY(SV *self_sv)
     CODE:
         DEFERRED_CLASS_TYPE* self = _get_deferred_from_sv(aTHX_ self_sv);
 
-        xspr_promise_decref(aTHX_ self->promise);
+        fprintf(stderr, "before free promise\n");
+        Safefree(self->promise);
+        fprintf(stderr, "after free promise\n");
         Safefree(self);
