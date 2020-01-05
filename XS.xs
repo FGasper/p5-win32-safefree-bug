@@ -3,15 +3,12 @@
 #include "perl.h"
 #include "XSUB.h"
 
-#include <stdbool.h>
 #include <unistd.h>
 
 #define MY_CXT_KEY "Demo::XS::_guts" XS_VERSION
 
 #define DEFERRED_CLASS "Demo::XS::Deferred"
 #define DEFERRED_CLASS_TYPE Demo__XS__Deferred
-
-#define PROMISE_CLASS "Demo::XS::Promise"
 
 typedef struct xspr_promise_s xspr_promise_t;
 
