@@ -22,7 +22,6 @@
 typedef struct xspr_callback_s xspr_callback_t;
 typedef struct xspr_promise_s xspr_promise_t;
 typedef struct xspr_result_s xspr_result_t;
-typedef struct xspr_callback_queue_s xspr_callback_queue_t;
 
 typedef enum {
     XSPR_STATE_NONE,
@@ -82,18 +81,7 @@ struct xspr_promise_s {
     };
 };
 
-struct xspr_callback_queue_s {
-    xspr_promise_t* origin;
-    xspr_callback_t* callback;
-    xspr_callback_queue_t* next;
-};
-
-void xspr_callback_process(pTHX_ xspr_callback_t* callback, xspr_promise_t* origin);
-void xspr_callback_free(pTHX_ xspr_callback_t* callback);
-
 xspr_promise_t* xspr_promise_new(pTHX);
-void xspr_promise_then(pTHX_ xspr_promise_t* promise, xspr_callback_t* callback);
-void xspr_promise_finish(pTHX_ xspr_promise_t* promise, xspr_result_t *result);
 void xspr_promise_decref(pTHX_ xspr_promise_t* promise);
 
 void xspr_result_decref(pTHX_ xspr_result_t* result);
@@ -111,30 +99,6 @@ typedef struct {
 } DEFERRED_CLASS_TYPE;
 
 START_MY_CXT
-
-/* Frees the xspr_callback_t structure */
-void xspr_callback_free(pTHX_ xspr_callback_t *callback)
-{
-    if (callback->type == XSPR_CALLBACK_CHAIN) {
-        xspr_promise_decref(aTHX_ callback->chain);
-
-    } else if (callback->type == XSPR_CALLBACK_PERL) {
-        SvREFCNT_dec(callback->perl.on_resolve);
-        SvREFCNT_dec(callback->perl.on_reject);
-        if (callback->perl.next != NULL)
-            xspr_promise_decref(aTHX_ callback->perl.next);
-
-    } else if (callback->type == XSPR_CALLBACK_FINALLY) {
-        SvREFCNT_dec(callback->finally.on_finally);
-        if (callback->finally.next != NULL)
-            xspr_promise_decref(aTHX_ callback->finally.next);
-
-    } else {
-        assert(0);
-    }
-
-    Safefree(callback);
-}
 
 /* Decrements the ref count for the xspr_result_t, freeing the structure if needed */
 void xspr_result_decref(pTHX_ xspr_result_t* result)
@@ -154,13 +118,7 @@ void xspr_promise_decref(pTHX_ xspr_promise_t *promise)
 {
     if (--(promise->refs) == 0) {
         if (promise->state == XSPR_STATE_PENDING) {
-            /* XXX: is this a bad thing we should warn for? */
-            int count = promise->pending.callbacks_count;
             xspr_callback_t **callbacks = promise->pending.callbacks;
-            int i;
-            for (i = 0; i < count; i++) {
-                xspr_callback_free(aTHX_ callbacks[i]);
-            }
             Safefree(callbacks);
 
         } else {
